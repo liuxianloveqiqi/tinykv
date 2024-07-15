@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -165,24 +164,153 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	// create raft
+	hardState, confState, _ := c.Storage.InitialState()
+	var raft = &Raft{
+		id:               c.ID,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress), // follower's nextIndex
+		State:            StateFollower,
+		votes:            make(map[uint64]bool),
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+		heartbeatElapsed: 0,
+		electionElapsed:  0,
+	}
+	if c.peers == nil {
+		c.peers = confState.Nodes
+	}
+	if c.Applied > 0 {
+		raft.RaftLog.applied = c.Applied
+	}
+
+	lastIndex := raft.RaftLog.LastIndex()
+	for _, peer := range c.peers {
+		raft.Prs[peer] = &Progress{Next: lastIndex + 1, Match: 0}
+	}
+	raft.becomeFollower(0, None)
+	return raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
-	return false
+
+	// 计算上一条日志的索引
+	prevIndex := r.Prs[to].Next - 1
+	// 尝试获取上一条日志的任期
+	prevLogTerm, err := r.RaftLog.Term(prevIndex)
+	// 如果出现错误（例如日志不存在），尝试发送快照消息
+	if err != nil {
+		// 构造并发送快照消息
+		err := r.Step(pb.Message{MsgType: pb.MessageType_MsgSnapshot})
+		// 如果发送快照消息时出错，或者快照消息发送成功，都返回false，表示未能成功发送Append消息
+		if err != nil {
+			return false
+		}
+		return false
+	}
+
+	// 初始化要发送的日志条目切片
+	var entries []*pb.Entry
+	// 获取最后一条日志的索引加1，即下一条日志的预期索引
+	n := r.RaftLog.LastIndex() + 1
+	// 获取日志的第一条索引
+	firstIndex := r.RaftLog.FirstIndex()
+	// 从上一条日志的下一条开始，到最后一条日志，将日志条目添加到发送切片中
+	for i := prevIndex + 1; i < n; i++ {
+		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+	}
+	// 构造Append消息
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed,
+		LogTerm: prevLogTerm,
+		Index:   prevIndex,
+		Entries: entries,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
+
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	if _, ok := r.Prs[to]; !ok {
+		return
+	}
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed,
+		Entries: nil,
+	}
+	r.msgs = append(r.msgs, msg)
+}
+
+func (r *Raft) sendRequestVote(to uint64) bool {
+	// 获取最后一条日志的索引
+	lastIndex := r.RaftLog.LastIndex()
+	// 获取最后一条日志的任期
+	lastLogTerm, err := r.RaftLog.Term(lastIndex)
+	// 如果获取日志任期时出现错误（例如日志不存在），则尝试发送快照消息
+	if err != nil {
+		err := r.Step(pb.Message{MsgType: pb.MessageType_MsgSnapshot})
+		// 如果发送快照消息时出错，返回false，表示请求投票失败
+		if err != nil {
+			return false
+		}
+		return false
+	}
+
+	// 构造请求投票的消息，注意这里entries可以不用
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVote, // 消息类型：请求投票
+		From:    r.id,                          // 发送者ID
+		To:      to,                            // 接收者ID
+		Term:    r.Term,                        // 当前任期
+		Commit:  r.RaftLog.committed,           // 已提交的日志索引
+		LogTerm: lastLogTerm,                   // 最后一条日志的任期
+		Index:   lastIndex,                     // 最后一条日志的索引
+		Entries: nil,                           // 请求投票消息不包含日志条目
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	switch r.State {
+	case StateFollower:
+		fallthrough // 如果当前状态是follower，执行与candidate相同的逻辑
+	case StateCandidate:
+		r.electionElapsed++                         // 增加选举计时器
+		if r.electionElapsed >= r.electionTimeout { // 如果达到选举超时
+			r.electionElapsed = 0                                     // 重置选举计时器
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}) // 触发新一轮选举
+			if err != nil {                                           // 如果处理消息时出错
+				return // 直接返回，不继续执行
+			}
+		}
+	case StateLeader:
+		r.heartbeatElapsed++                          // 增加心跳计时器
+		if r.heartbeatElapsed >= r.heartbeatTimeout { // 如果达到心跳超时
+			r.heartbeatElapsed = 0                                     // 重置心跳计时器
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat}) // 发送心跳消息
+			if err != nil {                                            // 如果处理消息时出错
+				return // 直接返回，不继续执行
+			}
+		}
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -236,4 +364,20 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// softState 返回 Raft 实例的当前软状态。
+// softState包括当前的领导者和 Raft 的状态（追随者，候选人，领导者）。
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+// hardState 返回 Raft 实例的当前硬状态。
+// hardState包括当前的任期，当前任期的投票，以及已知被提交的最高日志条目的索引。
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }

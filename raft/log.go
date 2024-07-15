@@ -14,18 +14,22 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"log"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
 type RaftLog struct {
 	// storage contains all stable entries since the last snapshot.
+
 	storage Storage
 
 	// committed is the highest log position that is known to be in
@@ -50,13 +54,49 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	firstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	if storage == nil {
+		log.Panic("storage must not be nil")
+	}
+
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		panic(err)
+	}
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	raftLog := &RaftLog{
+		storage:   storage,
+		committed: hardState.Commit,
+		/* exists bug but all program depend on it
+		func (ms *MemoryStorage) firstIndex() uint64 {
+			return ms.ents[0].Index + 1
+		}*/
+		applied:         firstIndex - 1,
+		stabled:         lastIndex,
+		entries:         entries,
+		pendingSnapshot: nil,
+		firstIndex:      firstIndex,
+	}
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -71,29 +111,54 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	// 日志索引一般不是从0开始的，所以这里要用日志索引去映射切片索引
+	return l.entries[l.stabled-l.firstIndex+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.applied-l.firstIndex+1 : l.committed-l.firstIndex+1]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) == 0 {
+		i, _ := l.storage.LastIndex()
+		return i
+	}
+
+	//return l.entries[0].Index + uint64(len(l.entries)) - 1
+	return l.entries[len(l.entries)-1].Index
+}
+
+func (l *RaftLog) FirstIndex() uint64 {
+	// Your Code Here (2A).
+	return l.entries[0].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	offset := l.stabled
+	if i > offset {
+		index := i - l.entries[0].Index
+		if index >= uint64(len(l.entries)) {
+			return 0, ErrUnavailable
+		}
+		return l.entries[index].Term, nil
+	}
+	// please find in the storage
+	term, err := l.storage.Term(i)
+	if err != nil {
+		return 0, err
+	}
+	return term, nil
 }

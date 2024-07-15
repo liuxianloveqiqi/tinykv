@@ -154,4 +154,4 @@ Value log 中的数据都是直接 append 的，不需要和 LSM 一样需要实
 
 Project 1还是很简单的
 
-![image-20240714160611374](/Users/liuxian/Library/Application Support/typora-user-images/image-20240714160611374.png)
+![image-20240714221253193](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202407142212260.png)
