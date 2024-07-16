@@ -77,6 +77,33 @@ Raft 通过基础的两个 RPC 来维持节点之间的通信，分别为日志�
 
 
 
-结果：
+#### 困难点：
+
+第一次：
+
+1.TestFollowerUpdateTermFromMessage2AA
+
+在 Follower 处理handleAppendEntries 时，同时也要更新自己的 Term
+
+2.TestCandidateUpdateTermFromMessage2AA
+
+论文中写当 candidate 如果收到新leader的AppendEntries RPC：转为follower，这里新 leader 的判断，我本来写的是 m.Term==r.Term,但是应该改成>=更妥当，同理，Leader 也进行这样的更改，同时为了保险，直接在 Step 中就加上 if m.Term>r.Term{ r.becomeFollow(m.From,None) } 的逻辑,这里也是我论文看的不够仔细了
+
+3.TestFollowerVote2AA
+
+这里是 Follower 的情况没有处理 MsgRequestVote 的 Message，在 Follower 增加对MsgRequestVote 的处理
+
+4.TestFollowerElectionTimeoutRandomized2AA
+
+这里没有随机超时，因为 Raft 为了防止分裂投票，选举超时在一定范围获得，我们引入 rand 包，来实现随即超时
+
+5.RequestVote
+
+这里是节点在接收到 RequestVote 处理时，也需要对应地更新 term
+
+
+
+#### 结果：
 
 ![image-20240716105156180](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202407161051384.png)
+

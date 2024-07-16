@@ -118,13 +118,19 @@ func (l *RaftLog) allEntries() []pb.Entry {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	// 日志索引一般不是从0开始的，所以这里要用日志索引去映射切片索引
-	return l.entries[l.stabled-l.firstIndex+1:]
+	if len(l.entries) > 0 {
+		return l.entries[l.stabled-l.FirstIndex()+1:]
+	}
+	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return l.entries[l.applied-l.firstIndex+1 : l.committed-l.firstIndex+1]
+	if len(l.entries) > 0 {
+		return l.entries[l.applied-l.FirstIndex()+1 : l.committed-l.FirstIndex()+1]
+	}
+	return nil
 }
 
 // LastIndex return the last index of the log entries
@@ -141,13 +147,17 @@ func (l *RaftLog) LastIndex() uint64 {
 
 func (l *RaftLog) FirstIndex() uint64 {
 	// Your Code Here (2A).
+	if len(l.entries) == 0 {
+		i, _ := l.storage.FirstIndex()
+		return i
+	}
 	return l.entries[0].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	offset := l.stabled
+	/* offset := l.stabled
 	if i > offset {
 		index := i - l.entries[0].Index
 		if index >= uint64(len(l.entries)) {
@@ -156,6 +166,22 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return l.entries[index].Term, nil
 	}
 	// please find in the storage
+	term, err := l.storage.Term(i)
+	if err != nil {
+		return 0, err
+	}
+	return term, nil */
+	if len(l.entries) > 0 {
+		offset := l.FirstIndex()
+		if i >= offset {
+			index := i - l.FirstIndex()
+			if index >= uint64(len(l.entries)) {
+				return 0, ErrUnavailable
+			}
+			return l.entries[index].Term, nil
+		}
+	}
+	// 已经持久化好的直接拿
 	term, err := l.storage.Term(i)
 	if err != nil {
 		return 0, err

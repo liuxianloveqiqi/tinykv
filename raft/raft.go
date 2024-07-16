@@ -192,7 +192,7 @@ func newRaft(c *Config) *Raft {
 	for _, peer := range c.peers {
 		raft.Prs[peer] = &Progress{Next: lastIndex + 1, Match: 0}
 	}
-	raft.becomeFollower(0, None)
+	// raft.becomeFollower(0, None)
 	return raft
 }
 
@@ -355,16 +355,20 @@ func (r *Raft) becomeLeader() {
 		r.Prs[peer].Next = lastIndex + 1
 		r.Prs[peer].Match = 0 // 重置follower的匹配索引
 	}
-	r.Prs[r.id].Next += 1                // 将领导者的下一个日志条目索引增加1
-	r.Prs[r.id].Match = r.Prs[r.id].Next // 更新领导者的匹配索引
 
 	// 向日志中添加一个空操作条目，表示领导者在当前任期内的操作
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
+	r.Prs[r.id].Next += 1
+	r.Prs[r.id].Match = r.Prs[r.id].Next
+
 	for peer := range r.Prs {
 		// tip:排除自己
 		if peer != r.id {
 			r.sendAppend(peer) // 向所有追随者发送追加日志请求
 		}
+	}
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.Prs[r.id].Match
 	}
 }
 
@@ -421,6 +425,7 @@ func (r *Raft) CandidateStep(m pb.Message) error {
 	case pb.MessageType_MsgBeat: //leader only
 	case pb.MessageType_MsgPropose: //dropped
 	case pb.MessageType_MsgAppend:
+		// candidate如果收到term更大的message，则会转为follower
 		if m.Term >= r.Term {
 			r.becomeFollower(m.Term, m.From)
 		}
@@ -431,11 +436,12 @@ func (r *Raft) CandidateStep(m pb.Message) error {
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.votes[m.From] = !m.Reject
 		voteNum := len(r.votes)
+		// 投票没有半数直接返回
 		length := len(r.Prs) / 2
 		if voteNum <= length {
 			return nil
 		}
-
+		// 统计投票结果并且决定身份转化
 		grant := 0
 		denials := 0
 		for _, status := range r.votes {
@@ -510,12 +516,14 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	if r.State != StateFollower && m.Term > r.Term {
 		r.becomeFollower(m.Term, None)
 	}
-	// 如果未投票或已投给请求者，投给别人就不能投了，直接拒绝，重复投票只视为一次有效投
+	// term小就要投票
+	if r.Term < m.Term {
+		r.Vote = None
+		r.Term = m.Term
+	}
+
+	// 如果未投票或已投给请求者就能投，投给别人就不能投了，直接拒绝，重复投票只视为一次有效投
 	if r.Vote == None || r.Vote == m.From {
-		// 更新任期
-		if r.Term < m.Term {
-			r.Term = m.Term
-		}
 
 		lastIndex := r.RaftLog.LastIndex()
 		lastTerm, _ := r.RaftLog.Term(lastIndex)
@@ -586,20 +594,25 @@ func (r *Raft) handleMsgPropose(m pb.Message) {
 	}
 }
 
+func (r *Raft) sendAppendResponse(to uint64, reject bool, index uint64) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Reject:  reject,
+		Index:   index,
+	}
+	r.msgs = append(r.msgs, msg)
+	return
+}
+
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	// 如果消息的任期小于当前任期，拒绝该消息并返回
 	if m.Term < r.Term {
-		msg := pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			From:    r.id,
-			To:      m.From,
-			Term:    r.Term,
-			Reject:  true,
-			Index:   0,
-		}
-		r.msgs = append(r.msgs, msg)
+		r.sendAppendResponse(m.From, true, 0)
 		return
 	}
 	// 如果消息的任期大于当前任期，更新当前任期
@@ -613,51 +626,55 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 重置选举计时器，随机减少一些时间，以避免同时到期
 	r.electionElapsed -= rand.Intn(r.electionTimeout)
 	// 检查日志一致性
+	index := m.Index
 	lastIndex := r.RaftLog.LastIndex()
 	if m.Index <= lastIndex {
 		LogTerm, _ := r.RaftLog.Term(m.Index)
-		// 如果日志任期匹配，更新日志
 		if m.LogTerm == LogTerm {
-			// 删除旧日志
-			if m.Index < lastIndex {
-				firstIndex := r.RaftLog.FirstIndex()
-				r.RaftLog.entries = r.RaftLog.entries[0 : m.Index-firstIndex+1]
-			}
-			// 追加新日志
+			// 如果存在冲突的条目（相同索引但任期不同），删除该条目及其之后的所有条目
+			// 遍历接收到的日志条目
 			for i, entry := range m.Entries {
-				entry.Term = r.Term
+				var Term uint64 // 用于存储日志条目的任期
+				// 设置每个日志条目的索引，基于消息中的起始索引加上偏移量
 				entry.Index = m.Index + uint64(i) + 1
-				r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+				// 如果条目的索引小于或等于当前节点的最后一个日志的索引，则需要检查任期以确定是否存在冲突
+				if entry.Index <= lastIndex {
+					Term, _ = r.RaftLog.Term(entry.Index)
+					// 如果任期不匹配，说明在当前索引处发生了冲突
+					if Term != entry.Term {
+						firstIndex := r.RaftLog.FirstIndex()
+						// 删除冲突条目及其之后的所有条目
+						r.RaftLog.entries = r.RaftLog.entries[0 : m.Index-firstIndex+1]
+						// TODO 更新最后一个索引为当前日志的最后一个索引
+						lastIndex = r.RaftLog.LastIndex()
+						// 将新条目追加到日志中
+						r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+					}
+				} else {
+					// 如果条目的索引大于当前节点的最后一个日志的索引，则直接追加到日志中
+					r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+				}
 			}
-			// 发送成功的 AppendResponse
-			r.Vote = None
-			msg := pb.Message{
-				MsgType: pb.MessageType_MsgAppendResponse,
-				From:    r.id,
-				To:      m.From,
-				Term:    r.Term,
-				Reject:  false,
-				Index:   m.Index + uint64(len(m.Entries)),
+			// 更新stable索引，stable索引表示在当前任期内，最后一个与领导者一致的日志条目的索引
+			for _, entry := range r.RaftLog.entries {
+				if entry.Term <= r.Term {
+					index = entry.Index
+				}
 			}
-			r.msgs = append(r.msgs, msg)
-			// leader有新的日志已经提交
+
+			r.RaftLog.stabled = index
+			r.Vote = None // 重置投票状态，因为已经接收到了领导者的日志条目
+			r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
+			// 如果领导者的commit索引大于当前节点的commit索引，则更新commit索引
+			// 这里使用min函数是为了确保不会将commit索引设置为超出当前日志范围的值
 			if m.Commit > r.RaftLog.committed {
-				// TODO 确保当前节点的committed值不会超过其实际接收到并存储的日志条目的范围
 				r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
 			}
 			return
 		}
 	}
 	// return reject AppendResponse
-	msg := pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		From:    r.id,
-		To:      m.From,
-		Term:    r.Term,
-		Reject:  true,
-		Index:   0,
-	}
-	r.msgs = append(r.msgs, msg)
+	r.sendAppendResponse(m.From, true, 0)
 	return
 }
 
@@ -669,10 +686,11 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 			说明节点A告知leader在它上面保存的最大日志索引ID为2，这样下一次leader就可以直接从索引为2的日志数据开始同步数据到节点A。
 			而如果没有这个RejectHint成员，leader只能在每次被拒绝数据同步后都递减1进行下一次数据同步，显然这样是低效的。
 		*/
-		r.Prs[m.From].Next = m.Index
+		r.Prs[m.From].Next--
 		r.sendAppend(m.From) // 重新发送附加日志请求
 		return
 	}
+	// 每次leader节点在收到一条MsgAppResp类型消息，同时msg.Reject又是false的情况下，都需要去检查当前有哪些日志是超过半数的节点同意的
 	// 更新follower的匹配和下一个日志索引
 	r.Prs[m.From].Match = m.Index
 	r.Prs[m.From].Next = m.Index + 1
@@ -687,12 +705,17 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 	sort.Sort(match)
 	// 找到中位数，即大多数节点已经commit的最小日志索引
 	Match := match[(len(r.Prs)-1)/2]
-
+	println("match:", Match, "r.RaftLog.committed:", r.RaftLog.committed)
 	if Match > r.RaftLog.committed {
 		logTerm, _ := r.RaftLog.Term(Match)
 		// 只有在同一任期才能commit
 		if logTerm == r.Term {
 			r.RaftLog.committed = Match
+			for peer := range r.Prs {
+				if peer != r.id {
+					r.sendAppend(peer)
+				}
+			}
 		}
 	}
 	return
@@ -720,6 +743,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	if m.From != r.Lead {
 		r.Lead = m.From
 	}
+
 	// 重置选举计时器，随机减少一些时间，以避免同时到期
 	r.electionElapsed -= rand.Intn(r.electionTimeout)
 	// 发送心跳响应消息，表示接收成功
