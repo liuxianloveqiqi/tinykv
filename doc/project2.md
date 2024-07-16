@@ -74,3 +74,9 @@ Raft 通过基础的两个 RPC 来维持节点之间的通信，分别为日志�
 ### project2aa
 
 ![img](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202407142230000.png)
+
+
+
+结果：
+
+![image-20240716105156180](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202407161051384.png)
