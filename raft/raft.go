@@ -252,6 +252,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
+		// 心跳还有作用就是用于告知节点哪些日志可以进行提交
 		Commit:  r.RaftLog.committed,
 		Entries: nil,
 	}
@@ -358,8 +359,9 @@ func (r *Raft) becomeLeader() {
 
 	// 向日志中添加一个空操作条目，表示领导者在当前任期内的操作
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
-	r.Prs[r.id].Next += 1
+	// Tips!!! 必须先match=next，再next++
 	r.Prs[r.id].Match = r.Prs[r.id].Next
+	r.Prs[r.id].Next += 1
 
 	for peer := range r.Prs {
 		// tip:排除自己
@@ -705,12 +707,13 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 	sort.Sort(match)
 	// 找到中位数，即大多数节点已经commit的最小日志索引
 	Match := match[(len(r.Prs)-1)/2]
-	println("match:", Match, "r.RaftLog.committed:", r.RaftLog.committed)
+	// println("match:", Match, "r.RaftLog.committed:", r.RaftLog.committed)
 	if Match > r.RaftLog.committed {
 		logTerm, _ := r.RaftLog.Term(Match)
 		// 只有在同一任期才能commit
 		if logTerm == r.Term {
 			r.RaftLog.committed = Match
+			// tips! leader 在 committed 发生变化的时候一定要去通知 follower，否则集群的 committed 会不同步
 			for peer := range r.Prs {
 				if peer != r.id {
 					r.sendAppend(peer)
@@ -744,6 +747,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.Lead = m.From
 	}
 
+	// Tip bug:TestCommitWithHeartbeat2AB，收到心跳后要同步committed
+	r.RaftLog.committed = m.Commit
 	// 重置选举计时器，随机减少一些时间，以避免同时到期
 	r.electionElapsed -= rand.Intn(r.electionTimeout)
 	// 发送心跳响应消息，表示接收成功
