@@ -70,28 +70,18 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
-	preReady *Ready
+	prevSoftState *SoftState
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
+	raft := newRaft(config)
 	rn := &RawNode{
-		Raft: newRaft(config),
-		preReady: &Ready{
-			SoftState: &SoftState{
-				Lead:      0,
-				RaftState: 0,
-			},
-			HardState: pb.HardState{
-				Term:                 0,
-				Vote:                 0,
-				Commit:               0,
-				XXX_NoUnkeyedLiteral: struct{}{},
-				XXX_unrecognized:     nil,
-				XXX_sizecache:        0,
-			},
-		},
+		Raft:          raft,
+		prevSoftState: raft.softState(),
+		prevHardState: raft.hardState(),
 	}
 	return rn, nil
 }
@@ -160,17 +150,35 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	// Your Code Here (2A).
-	softState := rn.Raft.softState()
-	hardState := rn.Raft.hardState()
-	return Ready{
-		SoftState:        softState,
-		HardState:        hardState,
+	ready := Ready{
+		SoftState:        nil,
+		HardState:        pb.HardState{},
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
-		Snapshot:         *rn.Raft.RaftLog.pendingSnapshot,
+		Snapshot:         pb.Snapshot{},
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 		Messages:         rn.Raft.msgs,
 	}
+
+	curSoftState := rn.Raft.softState()
+	// 如果当前软状态与之前保存的软状态不同，则更新 Ready 中的软状态，并更新之前保存的软状态
+	if !(curSoftState.Lead == rn.prevSoftState.Lead &&
+		curSoftState.RaftState == rn.prevSoftState.RaftState) {
+		ready.SoftState = curSoftState
+		rn.prevSoftState = curSoftState
+	}
+
+	curHardState := rn.Raft.hardState()
+	// 如果当前硬状态与之前保存的硬状态不相等，则更新 Ready 中的硬状态
+	// tip! 注释掉了更新之前保存的硬状态的代码，可能是因为在实际的 Ready 方法调用后，外部逻辑会处理这个更新
+	if !isHardStateEqual(curHardState, rn.prevHardState) {
+		ready.HardState = curHardState // 更新 Ready 中的硬状态
+		// rn.prevHardState = curHardState
+	}
+
+	// 清空 Raft 中待发送的msg列表
+	rn.Raft.msgs = nil
+
+	return ready // 返回填充好的 Ready 结构体
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
@@ -178,18 +186,30 @@ func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
 	// When Something needs to store return true else return false
 	// hardState changes return true
+	// 检查软状态是否有变化，如果有变化则返回 true
+	curSoftState := rn.Raft.softState()
+	if !isSoftStateEqual(curSoftState, rn.prevSoftState) {
+		return true
+	}
+
 	hardState := rn.Raft.hardState()
-	preHardState := rn.preReady.HardState
+	preHardState := rn.prevHardState
 	// 当前hardState不为空并且与之前的hardState不相等，则说明hardState发生了变化，需要持久化
 	if !IsEmptyHardState(hardState) &&
 		!isHardStateEqual(hardState, preHardState) {
 		return true
 	}
-	// unstable Entries or messages exists return true
+	// 如果存在未稳定的日志条目、待发送的消息或者有待提交的日志条目，则返回 true
 	if len(rn.Raft.RaftLog.unstableEntries()) > 0 ||
-		len(rn.Raft.msgs) > 0 {
+		len(rn.Raft.msgs) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 {
 		return true
 	}
+
+	// 如果存在待处理的快照，则返回 true
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		return true
+	}
+
 	return false
 }
 
@@ -199,7 +219,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	// update hardState
 	if !IsEmptyHardState(rd.HardState) {
-		rn.preReady.HardState = rd.HardState
+		rn.prevHardState = rd.HardState
 	}
 	if len(rd.Entries) > 0 {
 		// 更新持久化日志，将unstable的日志stable
