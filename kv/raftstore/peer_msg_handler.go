@@ -2,6 +2,9 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -38,35 +41,157 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// HandleRaftReady It is used to process the Ready passed by the rawNode
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+	// 1. 判断是否有新的 Ready，没有就什么都不处理；
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	// 2. 调用 SaveReadyState 将 Ready 中需要持久化的内容保存到 badger。如果 Ready 中存在 snapshot，则应用它
+	ready := d.RaftGroup.Ready()
+	result, err := d.peerStorage.SaveReadyState(&ready)
+	if err != nil || result == nil {
+		log.Error(err)
+		return
+	}
+	// 3. 如果message不为空，就要发送Message
+	if len(ready.Messages) != 0 {
+		d.Send(d.ctx.trans, ready.Messages)
+		//println("ready.Messages[0].Index:", ready.Messages[0].Index)
+	}
+	// 4. 应用已提交的日志条
+	if len(ready.CommittedEntries) != 0 {
+		for _, entry := range ready.CommittedEntries {
+			d.process(&entry)
+		}
+		kvWB := new(engine_util.WriteBatch)
+		d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+		// AppliedIndex 为最后一个已提交条目的索引，并将这个状态保存到存储系统。
+		err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			panic(err)
+		}
+		err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		if err != nil {
+			panic(err)
+		}
+	}
+	// 5. 调用 Advance() 推进 RawNode
+	d.RaftGroup.Advance(ready)
 }
 
+// 根据Requests Type 处理 Raft entry 应用到状态并且处理proposals的回调函数
+func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
+	kvWB := new(engine_util.WriteBatch)
+	// 跳过配置
+	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		return
+	}
+	// 将日志数据解码为请求，并根据请求的类别进行不同的操作
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		panic(err)
+	}
+	if len(msg.Requests) == 0 {
+		return
+	}
+
+	for _, req := range msg.Requests {
+		// applying
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+		case raft_cmdpb.CmdType_Put:
+			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+		case raft_cmdpb.CmdType_Delete:
+			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+		case raft_cmdpb.CmdType_Snap:
+		}
+		// callback after applying
+		if len(d.proposals) > 0 {
+			p := d.proposals[0]
+			// 检查索引是否<当前index，如果是说明proposal过时，因为它对应的日志条目已经被应用
+			// 需要传递一个表示命令过时的错误响应
+			if p.index < entry.Index {
+				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+			}
+			if p.index == entry.Index {
+				// 如果任期不一致，说明提案已经过时（可能是因为在处理过程中发生了领导者更换等情况
+				if p.term != entry.Term {
+					NotifyStaleReq(entry.Term, p.cb)
+				} else {
+					resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+					switch req.CmdType {
+					case raft_cmdpb.CmdType_Get:
+						// 对于Get请求的响应，需要从存储中获取对应的值并构造响应
+						value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+						resp.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Get,
+							Get: &raft_cmdpb.GetResponse{Value: value}}}
+					case raft_cmdpb.CmdType_Put:
+						resp.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Put,
+							Put: &raft_cmdpb.PutResponse{}}}
+					case raft_cmdpb.CmdType_Delete:
+						resp.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Delete,
+							Delete: &raft_cmdpb.DeleteResponse{}}}
+					case raft_cmdpb.CmdType_Snap:
+						//println("case raft_cmdpb.CmdType_Snap:")
+						// 如果请求的区域版本与当前区域版本不匹配，则返回错误响应
+						if msg.Header.RegionEpoch.Version != d.Region().RegionEpoch.Version {
+							p.cb.Done(ErrResp(&util.ErrEpochNotMatch{}))
+							return
+						}
+						resp.Responses = []*raft_cmdpb.Response{{CmdType: raft_cmdpb.CmdType_Snap,
+							Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}}}
+						// 对于Snap类型的请求，要把 callback 的 badger Txn 设置为只读的事务，以确保读取操作在一个一致的快照视图上执行
+						p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+					}
+					p.cb.Done(resp)
+				}
+			}
+			d.proposals = d.proposals[1:]
+		}
+	}
+
+	err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// HandleMsg 处理接收到的消息
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
+		// 处理 Raft 消息
 		raftMsg := msg.Data.(*rspb.RaftMessage)
 		if err := d.onRaftMsg(raftMsg); err != nil {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
 	case message.MsgTypeRaftCmd:
+		// 处理 Raft 命令
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
+		// 处理定时器消息
 		d.onTick()
 	case message.MsgTypeSplitRegion:
+		// 处理区域分裂消息
 		split := msg.Data.(*message.MsgSplitRegion)
 		log.Infof("%s on split with %v", d.Tag, split.SplitKey)
 		d.onPrepareSplitRegion(split.RegionEpoch, split.SplitKey, split.Callback)
 	case message.MsgTypeRegionApproximateSize:
+		// 处理区域近似大小消息
 		d.onApproximateRegionSize(msg.Data.(uint64))
 	case message.MsgTypeGcSnap:
+		// 处理 GC 快照消息
 		gcSnap := msg.Data.(*message.MsgGCSnap)
 		d.onGCSnap(gcSnap.Snaps)
 	case message.MsgTypeStart:
+		// 开始执行，启动定时器
 		d.startTicker()
 	}
 }
@@ -223,9 +348,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

@@ -199,7 +199,7 @@ func (rn *RawNode) HasReady() bool {
 		!isHardStateEqual(hardState, preHardState) {
 		return true
 	}
-	// 如果存在未稳定的日志条目、待发送的消息或者有待提交的日志条目，则返回 true
+	// 如果存在unstable entries、待发送的msg或者已经commited but no applied的日志条目，则返回 true
 	if len(rn.Raft.RaftLog.unstableEntries()) > 0 ||
 		len(rn.Raft.msgs) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 {
 		return true

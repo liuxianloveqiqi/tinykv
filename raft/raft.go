@@ -707,8 +707,10 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 	sort.Sort(match)
 	// 找到中位数，即大多数节点已经commit的最小日志索引
 	Match := match[(len(r.Prs)-1)/2]
-	// println("match:", Match, "r.RaftLog.committed:", r.RaftLog.committed)
-	if Match > r.RaftLog.committed {
+	matchTerm, _ := r.RaftLog.Term(Match)
+	//println("match:", Match, "r.RaftLog.committed:", r.RaftLog.committed)
+	// Raft 永远不会通过计算副本数目的方式去提交一个之前任期内的日志条目
+	if Match > r.RaftLog.committed && matchTerm == r.Term {
 		logTerm, _ := r.RaftLog.Term(Match)
 		// 只有在同一任期才能commit
 		if logTerm == r.Term {

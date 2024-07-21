@@ -181,7 +181,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 			return l.entries[index].Term, nil
 		}
 	}
-	// 已经持久化好的直接拿
+	// 如果entries为空，或者i>firstIndex，代表要从已经持久化的storage里面拿term
 	term, err := l.storage.Term(i)
 	if err != nil {
 		return 0, err
