@@ -315,6 +315,10 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	entLastIndex := entries[len(entries)-1].Index
 	wbFirstIndex, _ := ps.FirstIndex()
 	wbLastIndex, _ := ps.LastIndex()
+	// update ps.raftState
+	// tip!!! 这里要状态更新放在开始，无论后续操作是否成功
+	ps.raftState.LastIndex = entLastIndex
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	if entLastIndex < wbFirstIndex {
 		return nil
 	}
@@ -333,9 +337,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 		}
 	}
-	// update ps.raftState
-	ps.raftState.LastIndex = entLastIndex
-	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	return nil
 }
 

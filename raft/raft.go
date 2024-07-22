@@ -253,8 +253,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		To:      to,
 		Term:    r.Term,
 		// 心跳还有作用就是用于告知节点哪些日志可以进行提交
-		Commit:  r.RaftLog.committed,
-		Entries: nil,
+		Commit: r.RaftLog.committed,
 	}
 	r.msgs = append(r.msgs, msg)
 }
@@ -495,6 +494,9 @@ func (r *Raft) LeaderStep(m pb.Message) error {
 	case pb.MessageType_MsgSnapshot:
 	case pb.MessageType_MsgHeartbeat: //error
 	case pb.MessageType_MsgHeartbeatResponse:
+		if m.Reject {
+			r.sendAppend(m.From)
+		}
 	case pb.MessageType_MsgTransferLeader:
 	case pb.MessageType_MsgTimeoutNow:
 	}
@@ -628,7 +630,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 重置选举计时器，随机减少一些时间，以避免同时到期
 	r.electionElapsed -= rand.Intn(r.electionTimeout)
 	// 检查日志一致性
-	index := m.Index
 	lastIndex := r.RaftLog.LastIndex()
 	if m.Index <= lastIndex {
 		LogTerm, _ := r.RaftLog.Term(m.Index)
@@ -651,20 +652,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 						lastIndex = r.RaftLog.LastIndex()
 						// 将新条目追加到日志中
 						r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+						r.RaftLog.stabled = m.Index
 					}
 				} else {
 					// 如果条目的索引大于当前节点的最后一个日志的索引，则直接追加到日志中
 					r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 				}
 			}
-			// 更新stable索引，stable索引表示在当前任期内，最后一个与领导者一致的日志条目的索引
-			for _, entry := range r.RaftLog.entries {
-				if entry.Term <= r.Term {
-					index = entry.Index
-				}
-			}
-
-			r.RaftLog.stabled = index
 			r.Vote = None // 重置投票状态，因为已经接收到了领导者的日志条目
 			r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 			// 如果领导者的commit索引大于当前节点的commit索引，则更新commit索引
@@ -729,7 +723,7 @@ func (r *Raft) handleMsgAppendResponse(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// 如果消息的任期小于当前任期，则拒绝心跳并回复
-	if m.Term < r.Term {
+	if m.Term < r.Term || r.RaftLog.committed < m.Commit {
 		msg := pb.Message{
 			MsgType: pb.MessageType_MsgHeartbeatResponse,
 			From:    r.id,
@@ -750,7 +744,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 
 	// Tip bug:TestCommitWithHeartbeat2AB，收到心跳后要同步committed
-	r.RaftLog.committed = m.Commit
+	// r.RaftLog.committed = m.Commit
 	// 重置选举计时器，随机减少一些时间，以避免同时到期
 	r.electionElapsed -= rand.Intn(r.electionTimeout)
 	// 发送心跳响应消息，表示接收成功

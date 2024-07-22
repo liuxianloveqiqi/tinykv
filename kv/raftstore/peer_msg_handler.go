@@ -47,6 +47,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	//println("\nd.regionId:", d.regionId, "d.peer.PeerId():", d.peer.PeerId())
 	// 1. 判断是否有新的 Ready，没有就什么都不处理；
 	if !d.RaftGroup.HasReady() {
 		return
@@ -54,17 +55,19 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// 2. 调用 SaveReadyState 将 Ready 中需要持久化的内容保存到 badger。如果 Ready 中存在 snapshot，则应用它
 	ready := d.RaftGroup.Ready()
 	result, err := d.peerStorage.SaveReadyState(&ready)
-	if err != nil || result == nil {
-		log.Error(err)
+	if err != nil {
 		return
 	}
-	// 3. 如果message不为空，就要发送Message
+	if result != nil {
+
+	}
+	// 3. 如果message!=0，就要发送Message
 	if len(ready.Messages) != 0 {
 		d.Send(d.ctx.trans, ready.Messages)
 		//println("ready.Messages[0].Index:", ready.Messages[0].Index)
 	}
 	// 4. 应用已提交的日志条
-	if len(ready.CommittedEntries) != 0 {
+	if len(ready.CommittedEntries) > 0 {
 		for _, entry := range ready.CommittedEntries {
 			d.process(&entry)
 		}
@@ -232,13 +235,53 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// proposeRaftCommand 处理客户端 Raft 命令，进行预处理，序列化请求，提交提案，处理管理员请求。
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 预处理Raft命令，检查是否可以提出命令
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
+		// 如果预处理失败，返回错误响应
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+	if len(msg.Requests) != 0 {
+		for _, req := range msg.Requests {
+			var key []byte
+			// 根据请求类型获取键值
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				key = req.Get.Key
+			case raft_cmdpb.CmdType_Put:
+				key = req.Put.Key
+			case raft_cmdpb.CmdType_Delete:
+				key = req.Delete.Key
+			case raft_cmdpb.CmdType_Snap:
+				// 快照请求不需要处理键值
+			}
+			// 检查键值是否在当前Region范围内
+			err = util.CheckKeyInRegion(key, d.Region())
+			if err != nil {
+				// 如果键值不在当前Region，返回错误响应
+				cb.Done(ErrResp(err))
+				continue
+			}
+			// 序列化消息
+			data, err := msg.Marshal()
+			if err != nil && data != nil {
+				panic(err)
+			}
+			// 创建提案并添加到提案队列
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			// 向Raft组提出提案
+			err = d.RaftGroup.Propose(data)
+			if err != nil {
+				continue
+			}
+		}
+	} else if msg.AdminRequest != nil {
+		// TODO 如果是管理员请求，此处留空
+	}
 }
 
 func (d *peerMsgHandler) onTick() {

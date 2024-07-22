@@ -200,17 +200,13 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 	// 如果存在unstable entries、待发送的msg或者已经commited but no applied的日志条目，则返回 true
+	// unstable Entries or messages exists return true
 	if len(rn.Raft.RaftLog.unstableEntries()) > 0 ||
 		len(rn.Raft.msgs) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 {
 		return true
 	}
-
-	// 如果存在待处理的快照，则返回 true
-	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
-		return true
-	}
-
 	return false
+
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the

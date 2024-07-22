@@ -149,7 +149,7 @@ func (l *RaftLog) FirstIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
 		i, _ := l.storage.FirstIndex()
-		return i
+		return i - 1
 	}
 	return l.entries[0].Index
 }
