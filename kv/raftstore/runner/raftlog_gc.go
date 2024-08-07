@@ -27,9 +27,10 @@ func NewRaftLogGCTaskHandler() *raftLogGCTaskHandler {
 
 // gcRaftLog does the GC job and returns the count of logs collected.
 func (r *raftLogGCTaskHandler) gcRaftLog(raftDb *badger.DB, regionId, startIdx, endIdx uint64) (uint64, error) {
-	// Find the raft log idx range needed to be gc.
+	// 确定需要进行垃圾回收的日志索引范围。
 	firstIdx := startIdx
 	if firstIdx == 0 {
+		// 如果没有指定起始索引，则尝试从数据库中查找实际的起始索引。
 		firstIdx = endIdx
 		err := raftDb.View(func(txn *badger.Txn) error {
 			startKey := meta.RaftLogKey(regionId, 0)
@@ -49,21 +50,27 @@ func (r *raftLogGCTaskHandler) gcRaftLog(raftDb *badger.DB, regionId, startIdx, 
 	}
 
 	if firstIdx >= endIdx {
+		// 如果计算得到的起始索引大于等于结束索引，表示没有需要进行垃圾回收的日志。
 		log.Infof("no need to gc, [regionId: %d]", regionId)
 		return 0, nil
 	}
 
+	// 使用 WriteBatch 创建一个批量删除操作。
 	raftWb := engine_util.WriteBatch{}
 	for idx := firstIdx; idx < endIdx; idx += 1 {
+		// 为每个日志索引生成对应的日志键，并将其添加到批量删除操作中。
 		key := meta.RaftLogKey(regionId, idx)
 		raftWb.DeleteMeta(key)
 	}
 	if raftWb.Len() != 0 {
+		// 如果批量操作中有待删除的键，则将这些删除操作写入数据库。
 		if err := raftWb.WriteToDB(raftDb); err != nil {
 			return 0, err
 		}
 	}
+	// 返回被清理的日志数量。
 	return endIdx - firstIdx, nil
+
 }
 
 func (r *raftLogGCTaskHandler) reportCollected(collected uint64) {

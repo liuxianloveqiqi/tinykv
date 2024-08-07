@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"errors"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"log"
 )
@@ -104,6 +105,15 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// 在某些情况下，存储层（如 storage）会进行日志压缩操作，
+	// 将旧的日志条目从存储中删除，并更新 truncatedIndex。但是，内存中的 entries 列表可能还没有同步更新
+	truncatedIndex, _ := l.storage.FirstIndex()
+	if len(l.entries) > 0 {
+		firstIndex := l.entries[0].Index
+		if truncatedIndex > firstIndex {
+			l.entries = l.entries[truncatedIndex-firstIndex:]
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -119,6 +129,10 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	// 日志索引一般不是从0开始的，所以这里要用日志索引去映射切片索引
 	if len(l.entries) > 0 {
+		if (l.stabled-l.FirstIndex()+1 < 0) ||
+			(l.stabled-l.FirstIndex()+1 > uint64(len(l.entries))) {
+			return nil
+		}
 		return l.entries[l.stabled-l.FirstIndex()+1:]
 	}
 	return nil
@@ -137,8 +151,9 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		i, _ := l.storage.LastIndex()
-		return i
+		//i, _ := l.storage.LastIndex()
+		//return i
+		return l.stabled
 	}
 
 	//return l.entries[0].Index + uint64(len(l.entries)) - 1
@@ -157,20 +172,6 @@ func (l *RaftLog) FirstIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	/* offset := l.stabled
-	if i > offset {
-		index := i - l.entries[0].Index
-		if index >= uint64(len(l.entries)) {
-			return 0, ErrUnavailable
-		}
-		return l.entries[index].Term, nil
-	}
-	// please find in the storage
-	term, err := l.storage.Term(i)
-	if err != nil {
-		return 0, err
-	}
-	return term, nil */
 	if len(l.entries) > 0 {
 		offset := l.FirstIndex()
 		if i >= offset {
@@ -183,8 +184,12 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	// 如果entries为空，或者i>firstIndex，代表要从已经持久化的storage里面拿term
 	term, err := l.storage.Term(i)
-	if err != nil {
-		return 0, err
+	// 检查请求的索引是否在快照范围内
+	if errors.Is(err, ErrUnavailable) && !IsEmptySnap(l.pendingSnapshot) {
+		if i < l.pendingSnapshot.Metadata.Index {
+			// 如果请求的索引小于快照索引，返回错误
+			err = ErrCompacted
+		}
 	}
-	return term, nil
+	return term, err
 }

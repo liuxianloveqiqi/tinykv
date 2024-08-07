@@ -175,6 +175,11 @@ func (rn *RawNode) Ready() Ready {
 		// rn.prevHardState = curHardState
 	}
 
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
+
 	// 清空 Raft 中待发送的msg列表
 	rn.Raft.msgs = nil
 
@@ -203,6 +208,10 @@ func (rn *RawNode) HasReady() bool {
 	// unstable Entries or messages exists return true
 	if len(rn.Raft.RaftLog.unstableEntries()) > 0 ||
 		len(rn.Raft.msgs) > 0 || len(rn.Raft.RaftLog.nextEnts()) > 0 {
+		return true
+	}
+	// 有快照
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		return true
 	}
 	return false

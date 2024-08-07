@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"sort"
@@ -200,27 +201,22 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 
+	// 获取日志的第一条索引
+	firstIndex := r.RaftLog.FirstIndex()
 	// 计算上一条日志的索引
 	prevIndex := r.Prs[to].Next - 1
-	// 尝试获取上一条日志的任期
 	prevLogTerm, err := r.RaftLog.Term(prevIndex)
-	// 如果出现错误（例如日志不存在），尝试发送快照消息
-	if err != nil {
-		// 构造并发送快照消息
-		err := r.Step(pb.Message{MsgType: pb.MessageType_MsgSnapshot})
-		// 如果发送快照消息时出错，或者快照消息发送成功，都返回false，表示未能成功发送Append消息
-		if err != nil {
-			return false
-		}
-		return false
+	// 如果获取任期是快照的｜｜当 Leader 发现要发给 Follower 的 entry 已经被压缩时，发送快照
+	if err != nil || prevIndex < firstIndex-1 {
+		r.sendSnapshot(to)
+		return true
 	}
 
 	// 初始化要发送的日志条目切片
 	var entries []*pb.Entry
 	// 获取最后一条日志的索引加1，即下一条日志的预期索引
 	n := r.RaftLog.LastIndex() + 1
-	// 获取日志的第一条索引
-	firstIndex := r.RaftLog.FirstIndex()
+
 	// 从上一条日志的下一条开始，到最后一条日志，将日志条目添加到发送切片中
 	for i := prevIndex + 1; i < n; i++ {
 		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
@@ -262,16 +258,7 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 	// 获取最后一条日志的索引
 	lastIndex := r.RaftLog.LastIndex()
 	// 获取最后一条日志的任期
-	lastLogTerm, err := r.RaftLog.Term(lastIndex)
-	// 如果获取日志任期时出现错误（例如日志不存在），则尝试发送快照消息
-	if err != nil {
-		err := r.Step(pb.Message{MsgType: pb.MessageType_MsgSnapshot})
-		// 如果发送快照消息时出错，返回false，表示请求投票失败
-		if err != nil {
-			return false
-		}
-		return false
-	}
+	lastLogTerm, _ := r.RaftLog.Term(lastIndex)
 
 	// 构造请求投票的消息，注意这里entries可以不用
 	msg := pb.Message{
@@ -288,6 +275,35 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 	return true
 }
 
+// sendSnapshot sends a snapshot to the specified node.
+func (r *Raft) sendSnapshot(to uint64) {
+	if _, ok := r.Prs[to]; !ok {
+		return
+	}
+	var snapshot pb.Snapshot
+	var err error
+	// 自己的snapshot为空就要先生成一份
+	if IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+	} else {
+		snapshot = *r.RaftLog.pendingSnapshot
+	}
+	if err != nil {
+		return
+	}
+
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	return
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
@@ -297,7 +313,7 @@ func (r *Raft) tick() {
 	case StateCandidate:
 		r.electionElapsed++                         // 增加选举计时器
 		if r.electionElapsed >= r.electionTimeout { // 如果达到选举超时
-			r.electionElapsed = 0                                     // 重置选举计时器
+			r.electionElapsed = 0 - rand.Intn(r.electionTimeout)      // 重置选举计时器
 			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}) // 触发新一轮选举
 			if err != nil {                                           // 如果处理消息时出错
 				return // 直接返回，不继续执行
@@ -410,11 +426,13 @@ func (r *Raft) FollowerStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: //Candidate only
 	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: //leader only
 	case pb.MessageType_MsgTransferLeader:
 	case pb.MessageType_MsgTimeoutNow:
+		r.campaign()
 	}
 	return nil
 }
@@ -458,6 +476,7 @@ func (r *Raft) CandidateStep(m pb.Message) error {
 			r.becomeFollower(r.Term, m.From)
 		}
 	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, m.From)
@@ -466,6 +485,7 @@ func (r *Raft) CandidateStep(m pb.Message) error {
 	case pb.MessageType_MsgHeartbeatResponse: //leader only
 	case pb.MessageType_MsgTransferLeader:
 	case pb.MessageType_MsgTimeoutNow:
+		r.campaign()
 	}
 	return nil
 }
@@ -492,13 +512,19 @@ func (r *Raft) LeaderStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: //Candidate only
 	case pb.MessageType_MsgSnapshot:
-	case pb.MessageType_MsgHeartbeat: //error
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgHeartbeat:
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
-		if m.Reject {
+		if m.Reject || m.Commit < r.RaftLog.committed {
 			r.sendAppend(m.From)
 		}
 	case pb.MessageType_MsgTransferLeader:
 	case pb.MessageType_MsgTimeoutNow:
+		r.campaign()
 	}
 	return nil
 }
@@ -675,14 +701,25 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 }
 
 func (r *Raft) handleMsgAppendResponse(m pb.Message) {
+	/*
+		如果从节点拒绝了附加日志请求且索引小于初始日志索引，
+		说明从节点的日志严重落后或已经被压缩
+		在这种情况下，领导者应该发送快照给从节点，以使其状态与领导者同步。
+	*/
+	if m.Reject && m.Index < meta.RaftInitLogIndex {
+		r.sendSnapshot(m.From)
+		return
+	}
 	// 如果拒绝了附加日志请求
-	if m.Reject == true {
+	if m.Reject == true && m.Term <= r.Term {
 		/*
 			比如leader前面认为从日志索引为10的位置开始向节点A同步数据，但是节点A拒绝了这次数据同步同时返回RejectHint为2，
 			说明节点A告知leader在它上面保存的最大日志索引ID为2，这样下一次leader就可以直接从索引为2的日志数据开始同步数据到节点A。
 			而如果没有这个RejectHint成员，leader只能在每次被拒绝数据同步后都递减1进行下一次数据同步，显然这样是低效的。
 		*/
-		r.Prs[m.From].Next--
+		next := r.Prs[m.From].Next - 1
+		// 确保 Next 索引不会超过 Follower 实际保存的最大日志索引
+		r.Prs[m.From].Next = min(m.Index, next)
 		r.sendAppend(m.From) // 重新发送附加日志请求
 		return
 	}
@@ -761,6 +798,44 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+	// 如果快照索引小于等于已提交索引，或快照任期小于当前任期，表示该快照已经过期，需要舍弃
+	if meta.Index <= r.RaftLog.committed || meta.Term < r.Term {
+		return
+	}
+	// 更新日志的已应用、已提交和已稳定索引
+	r.Lead = m.From
+	r.Term = m.Term
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.stabled = meta.Index
+	// 如果当前日志条目不为空
+	if len(r.RaftLog.entries) > 0 {
+		// 如果快照索引大于最后一个日志索引，清空日志条目
+		if meta.Index > r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+		} else if meta.Index >= r.RaftLog.FirstIndex() {
+			// 截断日志条目，使其从快照索引开始
+			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.FirstIndex():]
+		}
+	}
+	// 如果当前日志条目为空，为防止出现错误，需要显示添加此条日志
+	if len(r.RaftLog.entries) == 0 {
+		r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+			EntryType: pb.EntryType_EntryNormal,
+			Term:      meta.Term,
+			Index:     meta.Index,
+		})
+	}
+	r.Prs = make(map[uint64]*Progress)
+	// 这里需要初始化一下prs,如果不这么做可能 r.Prs 会导致的空指针异常
+	for _, peer := range meta.ConfState.Nodes {
+		r.Prs[peer] = &Progress{
+			Match: 0,
+			Next:  meta.Index + 1,
+		}
+	}
+	r.RaftLog.pendingSnapshot = m.Snapshot
 }
 
 // addNode add a new node to raft group

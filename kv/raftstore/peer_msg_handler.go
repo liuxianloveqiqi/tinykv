@@ -5,6 +5,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -58,8 +59,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if err != nil {
 		return
 	}
-	if result != nil {
-
+	// 当region发生变化时，更新存储中的region信息
+	if result != nil && !reflect.DeepEqual(result.PrevRegion, result.Region) {
+		d.peerStorage.SetRegion(result.Region)
 	}
 	// 3. 如果message!=0，就要发送Message
 	if len(ready.Messages) != 0 {
@@ -101,6 +103,26 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
 		panic(err)
 	}
 	if len(msg.Requests) == 0 {
+		if msg.AdminRequest != nil {
+			req := msg.AdminRequest
+			switch req.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				compactLog := req.GetCompactLog()
+				// 检查请求中的日志压缩Index是否>=现在已经压缩的日志Index，如果是则需要apply
+				if compactLog.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+					d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+					d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+					kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+					if err != nil {
+						panic(err)
+					}
+					// 创建一个Task交给raftLogGCWorker，这里是要回收记录的raft log元数据
+					d.ScheduleCompactLog(compactLog.CompactIndex)
+				}
+			case raft_cmdpb.AdminCmdType_Split:
+			}
+		}
 		return
 	}
 
@@ -179,7 +201,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
-		// 处理定时器消息
+		// 处理定时器消息，任务之一就是检查是否需要压缩日志
 		d.onTick()
 	case message.MsgTypeSplitRegion:
 		// 处理区域分裂消息
@@ -280,7 +302,18 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			}
 		}
 	} else if msg.AdminRequest != nil {
-		// TODO 如果是管理员请求，此处留空
+		req := msg.AdminRequest
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_ChangePeer: // 3A
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			d.RaftGroup.Propose(data)
+		case raft_cmdpb.AdminCmdType_TransferLeader: // 3A
+		case raft_cmdpb.AdminCmdType_Split: // 3A
+		}
 	}
 }
 
