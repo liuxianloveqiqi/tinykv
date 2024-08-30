@@ -426,12 +426,10 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 	return resp, nil
 }
 
+// KvBatchRollback 批量回滚 key
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
 	resp := &kvrpcpb.BatchRollbackResponse{}
-	if len(req.Keys) == 0 {
-		return resp, nil
-	}
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
 		if regionErr, ok := err.(*raft_storage.RegionError); ok {
@@ -444,8 +442,8 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
 	server.Latches.WaitForLatches(req.Keys)
 	defer server.Latches.ReleaseLatches(req.Keys)
-
 	for _, key := range req.Keys {
+		// 1. 获取 key 的 Write，如果已经是 WriteKindRollback 则跳过这个 key
 		write, _, err := txn.CurrentWrite(key)
 		if err != nil {
 			if regionErr, ok := err.(*raft_storage.RegionError); ok {
@@ -458,15 +456,13 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 			if write.Kind == mvcc.WriteKindRollback {
 				continue
 			} else {
-				txn.DeleteValue(key)
-				txn.PutWrite(key, req.StartVersion, &mvcc.Write{
-					StartTS: req.StartVersion,
-					Kind:    mvcc.WriteKindRollback,
-				})
 				resp.Error = &kvrpcpb.KeyError{Abort: "true"}
 				return resp, nil
 			}
 		}
+		// 获取 Lock，如果 Lock 被清除或者 Lock 不是当前事务的 Lock，则中止操作
+		// 这个时候说明 key 被其他事务占用
+		// 否则的话移除 Lock、删除 Value，写入 WriteKindRollback 的 Write
 		lock, err := txn.GetLock(key)
 		if err != nil {
 			if regionErr, ok := err.(*raft_storage.RegionError); ok {
@@ -475,15 +471,19 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 			}
 			return nil, err
 		}
-		txn.PutWrite(key, req.StartVersion, &mvcc.Write{
-			StartTS: req.StartVersion,
-			Kind:    mvcc.WriteKindRollback,
-		})
 		if lock == nil || lock.Ts != req.StartVersion {
+			txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
 			continue
 		}
 		txn.DeleteLock(key)
 		txn.DeleteValue(key)
+		txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+			StartTS: req.StartVersion,
+			Kind:    mvcc.WriteKindRollback,
+		})
 	}
 	err = server.storage.Write(req.Context, txn.Writes())
 	if err != nil {
