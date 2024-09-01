@@ -1,6 +1,6 @@
 # 架构图
 
-![img](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202408291810070.png)
+![img](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202408312005435.png)
 
 # 底层存储引擎RockesDB
 
@@ -15,6 +15,10 @@
 ## log日志
 
 ![img](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202408300950169.png)
+
+## Read Index
+
+![image-20240831173244481](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202408311732564.png)
 
 ## peer
 
@@ -37,3 +41,7 @@ MultiRaft 需要解决的一些核心问题：
 (3) 分片的调度，让负载在系统中更平均（分片副本的迁移，补全，Leader 切换等等）。
 
 ![image-20240830104751703](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202408301047829.png)
+
+# Percolator
+
+![image-20240901102835317](https://raw.githubusercontent.com/liuxianloveqiqi/Xian-imagehost/main/image/202409011028446.png)
